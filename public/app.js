@@ -15,8 +15,22 @@
 /** @type {HTMLCanvasElement} The play-area canvas. */
 const canvas = document.getElementById('canvas');
 
-/** @type {CanvasRenderingContext2D} The canvas drawing context. */
-const ctx = canvas.getContext('2d');
+/**
+ * The canvas drawing context. Not `const`: the fold renders the flat board
+ * into an offscreen buffer by pointing this at the buffer's context for the
+ * duration of one synchronous call (see renderBoardBuffer).
+ * @type {CanvasRenderingContext2D}
+ */
+let ctx = canvas.getContext('2d');
+
+/**
+ * Offscreen copy of the flat board, at the canvas's exact pixel size. The
+ * fold draws the board here once per frame and then samples it in vertical
+ * strips, so a moving sheet costs one board draw plus cheap drawImage calls
+ * rather than one full redraw per strip.
+ * @type {HTMLCanvasElement}
+ */
+const buffer = document.createElement('canvas');
 
 /** Margin/desktop colour around the contained 16:9 paper. */
 const MARGIN = '#1e1e1e';
@@ -39,6 +53,31 @@ const GRAVE_MS = 400;
 /** Total length of the death animation, in milliseconds. */
 const DEATH_MS = TOPPLE_MS + GRAVE_MS;
 
+/** Milliseconds the folding half takes to close over the other half. */
+const FOLD_IN_MS = 420;
+/** Milliseconds the sheet rests closed — the press that transfers the ink. */
+const FOLD_PRESS_MS = 150;
+/** Milliseconds the sheet takes to fall open again: the reveal. */
+const FOLD_OUT_MS = 520;
+/** Total length of one fold, in milliseconds. */
+const FOLD_TOTAL_MS = FOLD_IN_MS + FOLD_PRESS_MS + FOLD_OUT_MS;
+
+/**
+ * How far the sheet's free edge leads the hinge mid-fold, in radians. It
+ * vanishes at rest and at the press (sin 0 = sin PI = 0), so the sheet is
+ * dead flat when it must be and bows like paper while it moves.
+ */
+const FOLD_BEND = 0.42;
+
+/** Vertical strips the folding half is cut into while it moves. */
+const FOLD_SLICES = 64;
+
+/** Camera distance from the paper, as a multiple of the half width. */
+const FOLD_CAMERA = 3.5;
+
+/** Milliseconds a transferred shot mark takes to grow into place. */
+const LAND_MS = 180;
+
 /**
  * Death animations in flight, keyed "side:x:y" (the stickman's normalized
  * local coords, which never move) to the time the client first saw it dead.
@@ -48,6 +87,22 @@ const DEATH_MS = TOPPLE_MS + GRAVE_MS;
  * @type {Map<string, number>}
  */
 const deathAt = new Map();
+
+/**
+ * The fold animation in flight: which half lifts — the side the latest shot
+ * was fired from — and when it started. Null while the paper lies flat.
+ * @type {{side:'left'|'right', t0:number}|null}
+ */
+let fold = null;
+
+/**
+ * When each shot's transferred mark (the copy the fold presses onto the far
+ * side of the line) may show, keyed by the shot's index in `state.shots`.
+ * Stamped with the press moment of the fold the shot arrived with; indexes
+ * the latest state no longer carries are pruned in syncShots.
+ * @type {Map<number, number>}
+ */
+const landedAt = new Map();
 
 /** Client -> server: join the room (sent once, right after the socket opens). */
 const MSG_JOIN = 'join';
@@ -108,6 +163,13 @@ function resize() {
     canvas.width = Math.round(w * dpr);
     canvas.height = Math.round(h * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // The fold's offscreen board tracks the canvas exactly. Resizing a
+    // canvas clears it, which is fine: it is refilled before every fold frame.
+    if (buffer.width !== canvas.width || buffer.height !== canvas.height) {
+        buffer.width = canvas.width;
+        buffer.height = canvas.height;
+    }
 }
 
 /**
@@ -197,10 +259,12 @@ function deathKey(side, s) {
 /**
  * Record any stickman the latest state shows dead that is not yet animating,
  * and forget keys whose stickman is gone (a rematch regenerates the whole
- * board, so its old keys must not linger). Called with each incoming state.
+ * board, so its old keys must not linger). Called with each incoming state,
+ * right after the fold that state starts has been set up, so a fresh fall can
+ * be stamped for the fold's press.
  *
  * @param {object} st - The latest `state` message.
- * @returns {boolean} True when at least one death animation is still running.
+ * @returns {void}
  */
 function syncDeaths(st) {
     const now = performance.now();
@@ -212,11 +276,13 @@ function syncDeaths(st) {
             const key = deathKey(side, s);
             alive.add(key);
             if (!deathAt.has(key)) {
-                // Freshly seen dead: start its animation from the top. A
-                // stickman already dead when this page loaded (a reload
-                // mid-battle) gets the same treatment, which reads as a
-                // board settling rather than a bug.
-                deathAt.set(key, now);
+                // Freshly seen dead: start from the top — but wait for the
+                // press when a fold runs, so the opening sheet reveals the
+                // fall instead of it playing out underneath. A stickman
+                // already dead when this page loaded (a reload mid-battle)
+                // starts at once, which reads as a board settling rather
+                // than a bug.
+                deathAt.set(key, revealAt(now));
             }
         }
     }
@@ -224,8 +290,6 @@ function syncDeaths(st) {
     for (const key of Array.from(deathAt.keys())) {
         if (!alive.has(key)) deathAt.delete(key);
     }
-
-    return deathAt.size > 0;
 }
 
 /**
@@ -333,8 +397,10 @@ function drawToken(side, s, x, y, fw, fh, color) {
     const t = performance.now() - (deathAt.get(deathKey(side, s)) || 0);
     if (t < TOPPLE_MS) {
         // Falls away from the fold: the own half is on the left, so an own
-        // stickman tips left and a foe's tips right.
-        drawFallingStickman(x, y, fw, fh, color, t / TOPPLE_MS, side === 'opp');
+        // stickman tips left and a foe's tips right. t can be negative — a
+        // death stamped for the moment a fold presses waits flat and upright
+        // until the sheet comes down on it — so the progress clamps at zero.
+        drawFallingStickman(x, y, fw, fh, color, Math.max(0, t / TOPPLE_MS), side === 'opp');
     }
     if (t >= TOPPLE_MS - GRAVE_MS * 0.5) {
         // The grave starts rising before the fall finishes, so the two
@@ -353,12 +419,16 @@ function drawToken(side, s, x, y, fw, fh, color) {
  * @param {number} py - Dot centre y, logical px.
  * @param {string} color - Dot colour (ink for own shots, red for theirs).
  * @param {boolean} hit - Whether this shot hit a stickman.
+ * @param {number} [scale] - Growth in 0..1, used to pop a transferred mark
+ *   into place; omitted or 1 draws the dot at full size.
  * @returns {void}
  */
-function drawDot(c, px, py, color, hit) {
-    const r = Math.max(3, Math.min(c.w, c.h) * 0.014);
+function drawDot(c, px, py, color, hit, scale) {
+    const s = scale === undefined ? 1 : scale;
+    const r = Math.max(3, Math.min(c.w, c.h) * 0.014) * s;
 
     ctx.save();
+    ctx.globalAlpha = s;
     ctx.fillStyle = color;
     ctx.beginPath();
     ctx.arc(px, py, r, 0, Math.PI * 2);
@@ -522,9 +592,11 @@ function drawDisconnected(c) {
  * @returns {void}
  */
 function drawOverlays(c) {
-    if (state && state.phase === 'lobby') {
+    // Panels wait for the sheet to lie flat: a result announced mid-fold
+    // would fold away with the half it is printed on.
+    if (state && state.phase === 'lobby' && !fold) {
         drawPanel(c, 'Waiting for an opponent…', [], INK);
-    } else if (state && state.phase === 'over') {
+    } else if (state && state.phase === 'over' && !fold) {
         // Three outcomes: win, lose, or a draw — the last when the deciding
         // round wiped both boards. The server only settles the result once
         // both players have taken the shot their round owes them, so this
@@ -544,17 +616,385 @@ function drawOverlays(c) {
 }
 
 /**
- * Render one frame: desktop margin, contained 16:9 paper, vertical fold
- * line, stickmen, shots, HUD and overlays — all from the latest `state`.
+ * Absolute time anything first seen in the latest state may show itself: the
+ * moment the fold in flight presses down, or right away when the paper lies
+ * flat. Newly dead stickmen and newly transferred marks both wait for the
+ * press, so the opening sheet reveals them instead of them appearing under it.
+ *
+ * @param {number} now - The current time, in milliseconds.
+ * @returns {number} The timestamp to stamp a fresh animation with.
+ */
+function revealAt(now) {
+    if (!fold) return now;
+    const press = fold.t0 + FOLD_IN_MS;
+    return press > now ? press : now;
+}
+
+/**
+ * Stamp every shot the latest state carries that is not stamped yet, and
+ * forget indexes it no longer carries (a rematch empties the shot list, so a
+ * stale index must not pre-date the marks of the new battle). Called with
+ * each incoming state, right after the fold that state starts has been set.
+ *
+ * @param {object} st - The latest `state` message.
+ * @returns {void}
+ */
+function syncShots(st) {
+    const at = revealAt(performance.now());
+    const alive = new Set();
+
+    (st.shots || []).forEach((_, i) => {
+        alive.add(i);
+        if (!landedAt.has(i)) landedAt.set(i, at);
+    });
+
+    for (const i of Array.from(landedAt.keys())) {
+        if (!alive.has(i)) landedAt.delete(i);
+    }
+}
+
+/**
+ * Start a fold when `next` brings a shot `prev` did not have: the half that
+ * shot was fired from lifts, swings over the fold line and presses its mark
+ * onto the other side. The first state never folds (it may already carry
+ * shots from a page reload), a shrinking shot list is a rematch or a leave,
+ * and a fold already in flight keeps running — its strips re-sample the
+ * buffer every frame, so the newest state shows up inside it anyway.
+ *
+ * @param {object|null} prev - The previous `state` message, or null.
+ * @param {object} next - The new `state` message.
+ * @returns {void}
+ */
+function maybeStartFold(prev, next) {
+    if (fold || !prev) return;
+    const was = (prev.shots || []).length;
+    const now = (next.shots || []).length;
+    if (now <= was) return;
+    const shot = next.shots[now - 1];
+    fold = { side: shot.by === 'you' ? 'left' : 'right', t0: performance.now() };
+}
+
+/**
+ * Eased 0..1 curve for the fold: at rest at both ends, quickest in the
+ * middle — the way a hand folds a sheet shut and lets it fall open.
+ *
+ * @param {number} t - Progress in 0..1.
+ * @returns {number} Eased progress in 0..1.
+ */
+function easeFold(t) {
+    const k = Math.min(1, Math.max(0, t));
+    return 0.5 - 0.5 * Math.cos(Math.PI * k);
+}
+
+/**
+ * The sheet's angle at `elapsed` ms into the animation: flat (0), closing to
+ * fully folded (PI), resting there through the press, then opening back to
+ * flat. Past FOLD_TOTAL_MS it reports 0, the position the flat path draws.
+ *
+ * @param {number} elapsed - Milliseconds since the fold started.
+ * @returns {number} The angle in radians.
+ */
+function foldAngle(elapsed) {
+    if (elapsed < FOLD_IN_MS) return Math.PI * easeFold(elapsed / FOLD_IN_MS);
+    if (elapsed < FOLD_IN_MS + FOLD_PRESS_MS) return Math.PI;
+    if (elapsed < FOLD_TOTAL_MS) {
+        return Math.PI * (1 - easeFold((elapsed - FOLD_IN_MS - FOLD_PRESS_MS) / FOLD_OUT_MS));
+    }
+    return 0;
+}
+
+/**
+ * The angle of one strip of the sheet, at distance d from the hinge. The
+ * bend term makes the free edge lead the hinge while the sheet closes and
+ * trail it while it opens — like paper, not like a door — and it vanishes at
+ * both ends of the move (sin 0 = sin PI = 0), so the sheet is dead flat at
+ * rest and during the press.
+ *
+ * @param {number} theta - The sheet's base angle, in radians.
+ * @param {number} d - Distance from the fold line, logical px.
+ * @param {number} halfW - Half the paper's width, logical px.
+ * @returns {number} The strip's angle, clamped to 0..PI.
+ */
+function flapTheta(theta, d, halfW) {
+    const t = theta + FOLD_BEND * Math.sin(theta) * (d / halfW);
+    return Math.min(Math.PI, Math.max(0, t));
+}
+
+/**
+ * Render the flat board into the offscreen buffer. Every drawing routine
+ * targets the module-level `ctx`, so this points `ctx` at the buffer for the
+ * duration of the call and puts it back afterwards — the call is synchronous,
+ * so no other draw can observe the swap.
+ *
+ * @returns {void}
+ */
+function renderBoardBuffer() {
+    const main = ctx;
+    const bctx = buffer.getContext('2d');
+    ctx = bctx;
+    bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawBoard(contain(), false);
+    ctx = main;
+}
+
+/**
+ * Copy a rectangle of the buffer onto the canvas. Source coordinates are in
+ * the buffer's backing pixels (logical px times dpr), destination coordinates
+ * are logical px in the current transform — so this also works while a strip
+ * transform is installed.
+ *
+ * @param {number} x - Left edge, logical px.
+ * @param {number} y - Top edge, logical px.
+ * @param {number} bw - Width, logical px.
+ * @param {number} bh - Height, logical px.
+ * @returns {void}
+ */
+function blit(x, y, bw, bh) {
+    ctx.drawImage(buffer, x * dpr, y * dpr, bw * dpr, bh * dpr, x, y, bw, bh);
+}
+
+/**
+ * Draw the transferred copy of every shot: the mark the fold pressed onto the
+ * far side of the line, mirrored exactly across the fold from where it was
+ * aimed — which is where it landed, since the server's hit test mirrors the
+ * same way. Each mark grows in when its `landedAt` stamp arrives (the press
+ * moment while a fold runs). `rect` clips the marks to one half, which is
+ * what the fold path needs to lay them over the stationary sheet.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
+ * @param {{x:number,y:number,w:number,h:number}|null} rect - Clip rect, or null for none.
+ * @param {number} now - The current time, in milliseconds.
+ * @returns {void}
+ */
+function drawLandingDots(c, rect, now) {
+    if (!state) return;
+    const fx = foldX();
+
+    ctx.save();
+    if (rect) {
+        ctx.beginPath();
+        ctx.rect(rect.x, rect.y, rect.w, rect.h);
+        ctx.clip();
+    }
+
+    (state.shots || []).forEach((shot, i) => {
+        const t = now - (landedAt.has(i) ? landedAt.get(i) : now);
+        if (t < 0) return; // not pressed through yet
+        const mine = shot.by === 'you';
+        const aimed = mine
+            ? c.x + shot.x * 0.5 * c.w
+            : c.x + 0.5 * c.w + shot.x * 0.5 * c.w;
+        drawDot(c, 2 * fx - aimed, c.y + shot.y * c.h,
+            mine ? INK : OPP_COLOR, !!shot.hit, Math.min(1, t / LAND_MS));
+    });
+
+    ctx.restore();
+}
+
+/**
+ * Shade one side of the fold line with a soft shadow that dies away from the
+ * hinge: the lifted sheet shades both the table it left behind and the sheet
+ * it still hangs over. Strongest mid-fold, gone at rest and during the press,
+ * where the sheet lies flat again.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} rect - The half to shade.
+ * @param {number} dir - +1 when the half lies right of the fold, -1 when left.
+ * @param {number} theta - The sheet's current angle, in radians.
+ * @returns {void}
+ */
+function shadeFoldSide(rect, dir, theta) {
+    const amount = Math.sin(theta);
+    if (amount <= 0.02) return;
+
+    const fx = dir > 0 ? rect.x : rect.x + rect.w;
+    const reach = rect.w * 0.5;
+    const grad = ctx.createLinearGradient(fx, 0, fx + dir * reach, 0);
+    grad.addColorStop(0, `rgba(0, 0, 0, ${(0.34 * amount).toFixed(3)})`);
+    grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+
+    ctx.fillStyle = grad;
+    ctx.fillRect(dir > 0 ? rect.x : rect.x + rect.w - reach, rect.y, reach, rect.h);
+}
+
+/**
+ * Shade one projected strip of the sheet. While its front faces us it darkens
+ * as it turns away from the light; past edge-on we are looking at the back of
+ * the sheet, so the strip washes towards blank paper and the ink on the far
+ * side shows through as a faint mirrored ghost.
+ *
+ * @param {number} x - Strip left edge, logical px (buffer space).
+ * @param {number} sw - Strip width, logical px.
+ * @param {{y:number,h:number}} c - The contain rect (the vertical extent).
+ * @param {number} theta - The strip's angle, in radians.
+ * @returns {void}
+ */
+function shadeSlice(x, sw, c, theta) {
+    const cos = Math.cos(theta);
+    if (cos >= 0) {
+        const a = 0.32 * (1 - cos); // flat-on: unshaded; edge-on: fully turned
+        if (a < 0.005) return;
+        ctx.fillStyle = `rgba(20, 20, 20, ${a.toFixed(3)})`;
+    } else {
+        ctx.fillStyle = `rgba(247, 243, 232, ${(0.55 * -cos).toFixed(3)})`;
+    }
+    ctx.fillRect(x, c.y, sw, c.h);
+}
+
+/**
+ * Draw the folding half as FOLD_SLICES vertical strips. A strip at distance d
+ * from the hinge swings to (d·cosθ, d·sinθ) in 3D, and a camera
+ * FOLD_CAMERA half-widths away scales that by L/(L − z); so every strip gets
+ * its own projected x and its own vertical scale. The strips narrow to nothing
+ * as the sheet turns edge-on, the free edge looms as it swings towards the
+ * viewer, and past edge-on the strips mirror over the fold line and lie down
+ * on the other half.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
+ * @param {number} fx - The fold line's x, logical px.
+ * @param {number} yc - The vertical centre the camera looks through.
+ * @param {number} theta - The sheet's base angle, in radians.
+ * @param {number} side - -1 when the sheet lies left of the fold, +1 right.
+ * @returns {void}
+ */
+function drawFlap(c, fx, yc, theta, side) {
+    const halfW = c.w / 2;
+    const halfH = c.h / 2;
+    const step = halfW / FOLD_SLICES;
+    const lens = FOLD_CAMERA * halfW;
+    // The sheet's own span in buffer coordinates: strips sample nothing else.
+    const sheetLo = side < 0 ? c.x : fx;
+    const sheetHi = side < 0 ? fx : c.x + c.w;
+
+    // Projected x, vertical scale and angle of every strip boundary.
+    const px = new Float64Array(FOLD_SLICES + 1);
+    const scale = new Float64Array(FOLD_SLICES + 1);
+    const angle = new Float64Array(FOLD_SLICES + 1);
+    for (let i = 0; i <= FOLD_SLICES; i++) {
+        const d = i * step;
+        const th = flapTheta(theta, d, halfW);
+        const s = lens / Math.max(lens - d * Math.sin(th), lens * 0.25);
+        angle[i] = th;
+        scale[i] = s;
+        px[i] = fx + side * (d * Math.cos(th) * s);
+    }
+
+    for (let i = 0; i < FOLD_SLICES; i++) {
+        // Source-space anchors: strip i runs from sxA to sxB on the sheet, and
+        // those two ends project to px[i] and px[i+1].
+        const sxA = fx + side * i * step;
+        const sxB = fx + side * (i + 1) * step;
+        const kx = (px[i + 1] - px[i]) / (sxB - sxA);
+        // Widen the source by half a pixel a side so neighbouring strips
+        // overlap instead of leaving hairline seams where bilinear sampling
+        // meets, clamped to the sheet so nothing samples past its edge.
+        const lo = Math.max(sheetLo, Math.min(sxA, sxB) - 0.5);
+        const hi = Math.min(sheetHi, Math.max(sxA, sxB) + 0.5);
+
+        ctx.save();
+        ctx.translate(px[i], yc);
+        ctx.scale(kx, (scale[i] + scale[i + 1]) / 2);
+        ctx.translate(-sxA, -yc);
+        blit(lo, c.y, hi - lo, c.h);
+        shadeSlice(lo, hi - lo, c, (angle[i] + angle[i + 1]) / 2);
+        ctx.restore();
+    }
+
+    // Paper thickness: outline the sheet's projected silhouette, which also
+    // hides the seams along the strips' top and bottom edges.
+    ctx.beginPath();
+    for (let i = 0; i <= FOLD_SLICES; i++) {
+        const y = yc - halfH * scale[i];
+        if (i === 0) ctx.moveTo(px[i], y);
+        else ctx.lineTo(px[i], y);
+    }
+    for (let i = FOLD_SLICES; i >= 0; i--) {
+        ctx.lineTo(px[i], yc + halfH * scale[i]);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(43, 43, 43, 0.4)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+}
+
+/**
+ * Draw the board mid-fold: the half that stays put straight from the buffer,
+ * the marks it is about to receive on top of it, the bare table where the
+ * sheet lifted off, and the sheet itself — strip by strip, as if it rotated
+ * about the fold line in 3D.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
+ * @returns {void}
+ */
+function drawFolded(c) {
+    const now = performance.now();
+    const theta = foldAngle(now - fold.t0);
+    const fx = foldX();
+    const yc = c.y + c.h / 2;
+    const halfW = c.w / 2;
+    const flapLeft = fold.side === 'left';
+
+    renderBoardBuffer();
+
+    ctx.save();
+    // The sheet may loom past the paper as it swings towards the viewer, so
+    // clip to the canvas rather than to the contain rect.
+    ctx.beginPath();
+    ctx.rect(0, 0, w, h);
+    ctx.clip();
+
+    // The half that stays put, 1:1 from the buffer.
+    const stX = flapLeft ? fx : c.x;
+    blit(stX, c.y, halfW, c.h);
+
+    // The transferred marks live here: stamped for the press, so they peek
+    // out from under the sheet as it opens.
+    drawLandingDots(c, { x: stX, y: c.y, w: halfW, h: c.h }, now);
+
+    // The table the sheet left behind, still shadowed by it, and the crease
+    // shadow on the sheet that stays.
+    shadeFoldSide({ x: flapLeft ? c.x : fx, y: c.y, w: halfW, h: c.h },
+        flapLeft ? -1 : 1, theta);
+    shadeFoldSide({ x: stX, y: c.y, w: halfW, h: c.h }, flapLeft ? 1 : -1, theta);
+
+    // The sheet itself, last, so it lies over everything it covers.
+    drawFlap(c, fx, yc, theta, flapLeft ? -1 : 1);
+
+    ctx.restore();
+}
+
+/**
+ * Render one frame: desktop margin, then either the flat board or — while a
+ * fold runs — the sheet lifting over the other half.
  * @returns {void}
  */
 function draw() {
     const c = contain();
 
-    // Desktop/margin fill around the paper.
+    // Desktop/margin fill around the paper. While a fold runs this is also
+    // the table showing through where the sheet used to lie.
     ctx.fillStyle = MARGIN;
     ctx.fillRect(0, 0, w, h);
 
+    if (fold) {
+        drawFolded(c);
+    } else {
+        drawBoard(c, true);
+    }
+}
+
+/**
+ * Draw the flat board: paper, fold line, stickmen, shot marks, HUD and
+ * overlays — all from the latest `state`. The fold path runs this into the
+ * buffer (landing false) and slices the result up; the flat path draws it
+ * straight onto the canvas with the transferred marks included.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
+ * @param {boolean} landing - Include the transferred shot marks. False when
+ *   drawing into the fold's buffer: the fold draws those itself, once the
+ *   press has revealed them.
+ * @returns {void}
+ */
+function drawBoard(c, landing) {
     // Clip everything to the paper rectangle.
     ctx.save();
     ctx.beginPath();
@@ -619,6 +1059,12 @@ function draw() {
             drawDot(c, px, c.y + shot.y * c.h, mine ? INK : OPP_COLOR, !!shot.hit);
         }
 
+        // Transferred marks, mirrored across the fold onto the half the shot
+        // landed on. The fold path holds these back until its press.
+        if (landing) {
+            drawLandingDots(c, null, performance.now());
+        }
+
         // Not your turn: your own half dims, so the board says at a glance
         // that nothing you click will fire yet. The opponent's half is the
         // target, never the trigger, so it stays clear.
@@ -647,17 +1093,41 @@ function render() {
 let animating = false;
 
 /**
- * Drive the death animations: repaint every frame while any stickman is
- * still toppling or rising as a grave, then stop. Restarted by syncDeaths
- * on each new state; never runs two loops at once.
+ * Whether any frame animation still has work to do: a sheet in flight, or a
+ * stickman that has not finished toppling or rising as a grave. Settled
+ * graves stamp a time long past, so they do not keep the loop alive — the
+ * old "any death key exists" test would have repainted forever after the
+ * first hit.
+ *
+ * @returns {boolean} True when the next frame needs to be painted.
+ */
+function animationsActive() {
+    if (fold) return true;
+    const now = performance.now();
+    for (const t of deathAt.values()) {
+        if (now - t < DEATH_MS) return true;
+    }
+    return false;
+}
+
+/**
+ * Drive the frame animations: repaint every frame while the sheet is folding
+ * or a stickman is still falling, then stop once the paper lies flat with
+ * every grave settled. Restarted by each new state; never runs two loops at
+ * once.
  * @returns {void}
  */
 function animate() {
     if (animating) return;
     animating = true;
     const tick = () => {
+        if (fold && performance.now() - fold.t0 >= FOLD_TOTAL_MS) {
+            // The sheet is flat again: the next paint draws the plain board,
+            // overlays and all.
+            fold = null;
+        }
         render();
-        if (deathAt.size > 0) {
+        if (animationsActive()) {
             requestAnimationFrame(tick);   // still animating: next frame
         } else {
             animating = false;
@@ -728,10 +1198,15 @@ function connect() {
         if (msg.type === MSG_WELCOME) {
             seat = typeof msg.seat === 'number' ? msg.seat : -1;
         } else if (msg.type === MSG_STATE) {
+            const prev = state;
             state = msg;                 // store the whole message, render as-is
-            // Stamp newly dead stickmen so their topple-into-grave animation
-            // starts on this frame, and keep repainting until it finishes.
-            if (syncDeaths(msg)) {
+            // A shot the last state did not have folds the half it was fired
+            // from; the marks and falls that state brings wait for the fold's
+            // press, and the loop repaints until everything has settled.
+            maybeStartFold(prev, msg);
+            syncShots(msg);
+            syncDeaths(msg);
+            if (animationsActive()) {
                 animate();
             } else {
                 render();
@@ -804,6 +1279,10 @@ function onClick(event) {
 
     // Ignore clicks that miss the paper entirely.
     if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
+
+    // The sheet is mid-fold: the board is busy, and the half it folds onto
+    // is covered anyway, so nothing is clickable until it lies flat again.
+    if (fold) return;
 
     // Game over: any click on the paper requests a rematch.
     if (state && state.phase === 'over') {
