@@ -5,7 +5,9 @@
  *
  * The canvas is contained at a 16:9 aspect ratio within the viewport and is
  * split by a vertical fold line: the current player owns the LEFT half, the
- * opponent the RIGHT.
+ * opponent the RIGHT. Everything — paper, stickmen, shots, HUD and overlays —
+ * is drawn on the canvas from the latest `state` message; the page carries no
+ * DOM UI of its own.
  *
  * @see ../AGENTS.md — Tailwind styling + JSDoc conventions.
  */
@@ -22,34 +24,75 @@ const MARGIN = '#1e1e1e';
 const PAPER = '#f7f3e8';
 /** Fold line colour. */
 const FOLD = '#b8a671';
-/** Ink (text / tokens) colour. */
+/** Ink (text / own tokens) colour. */
 const INK = '#2b2b2b';
+/** Opponent (targets, their shots) colour. */
+const OPP_COLOR = '#d10a1e';
 
 /** Target paper aspect ratio (width / height). */
 const RATIO = 16 / 9;
 
+/** Milliseconds a stickman takes to topple over once it is hit. */
+const TOPPLE_MS = 550;
+/** Milliseconds the grave takes to rise out of the paper after the topple. */
+const GRAVE_MS = 400;
+/** Total length of the death animation, in milliseconds. */
+const DEATH_MS = TOPPLE_MS + GRAVE_MS;
+
+/**
+ * Death animations in flight, keyed "side:x:y" (the stickman's normalized
+ * local coords, which never move) to the time the client first saw it dead.
+ * The server keeps hit stickmen on the board with `dead` set, so a key that
+ * lingers here is a stickman still on its way to becoming a grave; keys for
+ * stickmen the latest state no longer carries are pruned in syncDeaths.
+ * @type {Map<string, number>}
+ */
+const deathAt = new Map();
+
+/** Client -> server: join the room (sent once, right after the socket opens). */
 const MSG_JOIN = 'join';
+/** Client -> server: fire a shot; x/y are in the shooter's OWN local frame. */
 const MSG_SHOT = 'shot';
-const MSG_STICKMEN = 'stickmen';
+/** Client -> server: ask for a rematch while phase is "over". */
+const MSG_REMATCH = 'rematch';
+/** Server -> client: seat assignment, `{"type":"welcome","seat":n}`. */
+const MSG_WELCOME = 'welcome';
+/** Server -> client: full game state (phase, scores, stickmen, shots). */
+const MSG_STATE = 'state';
 
 /**
  * Coordinates are sent on the wire as normalized relative values in 0..1,
  * independent of the canvas/paper size. Both sides communicate this way:
  * the client sends `x`/`y` directly, and the server echoes them back.
+ *
+ * The paper's own half spans display x 0..0.5, but the wire's player-local
+ * frame spans 0..1 across that half alone — hence a shot at paper x `nx` is
+ * sent as `nx * 2`.
  */
 
 /** Logical (CSS) width of the play area, in px. */
 let w = 0;
-/**
- * Target stickmen received from the server. Each is a red rectangle
- * ({x,y,w,h} normalized 0–1 within the player's own half).
- * @type {Array<{x:number,y:number,w:number,h:number}>}
- */
-let stickmen = [];
 /** Logical (CSS) height of the play area, in px. */
 let h = 0;
 /** Device pixel ratio for crisp retina rendering. */
 let dpr = 1;
+
+/**
+ * Latest full `state` message from the server, stored whole and re-rendered
+ * as-is (the server sends display-frame coords, so no per-player switching).
+ * Null until the first state arrives.
+ * @type {object|null}
+ */
+let state = null;
+
+/** This connection's 0-based seat from the `welcome` message; -1 until it arrives. */
+let seat = -1;
+
+/** True only while tearing the socket down on purpose (page unload). */
+let closingIntentionally = false;
+
+/** True after an unexpected socket drop; shows the "reload to rejoin" banner. */
+let disconnected = false;
 
 /**
  * Resize the backing store to match the displayed size and reset the
@@ -93,8 +136,416 @@ function foldX() {
 }
 
 /**
+ * Draw one stickman FIGURE (head, torso, two arms, two legs) fitted inside
+ * the given rect. Both halves use the same routine; only the colour differs.
+ *
+ * @param {number} x - Left edge of the figure's rect, logical px.
+ * @param {number} y - Top edge of the figure's rect, logical px.
+ * @param {number} fw - Rect width, logical px.
+ * @param {number} fh - Rect height, logical px.
+ * @param {string} color - Stroke/outline colour (ink for own, red for foe).
+ * @returns {void}
+ */
+function drawStickman(x, y, fw, fh, color) {
+    const cx = x + fw / 2;
+    const headR = fh * 0.13;
+    const headY = y + fh * 0.02 + headR;   // head sits just inside the top
+    const neckY = headY + headR;
+    const hipY = y + fh * 0.62;
+    const shoulderY = neckY + fh * 0.05;
+
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = Math.max(1.5, fh * 0.05);
+    ctx.lineCap = 'round';
+
+    // Head: a filled circle.
+    ctx.beginPath();
+    ctx.arc(cx, headY, headR, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Torso, arms and legs: one stroked path.
+    ctx.beginPath();
+    ctx.moveTo(cx, neckY);                 // torso
+    ctx.lineTo(cx, hipY);
+    ctx.moveTo(cx, shoulderY);             // left arm, angled down
+    ctx.lineTo(cx - fw * 0.38, shoulderY + fh * 0.16);
+    ctx.moveTo(cx, shoulderY);             // right arm, angled down
+    ctx.lineTo(cx + fw * 0.38, shoulderY + fh * 0.16);
+    ctx.moveTo(cx, hipY);                  // left leg
+    ctx.lineTo(cx - fw * 0.3, y + fh);
+    ctx.moveTo(cx, hipY);                  // right leg
+    ctx.lineTo(cx + fw * 0.3, y + fh);
+    ctx.stroke();
+    ctx.restore();
+}
+
+/**
+ * Build the stable identity of one stickman for the death map. Coordinates
+ * are normalized and never change for a given token, so x/y alone tell the
+ * two armies apart ("own" vs "opp") and one token from another.
+ *
+ * @param {'own'|'opp'} side - Which army the token belongs to.
+ * @param {{x:number,y:number}} s - The stickman, in normalized local coords.
+ * @returns {string} The map key, e.g. "opp:0.3125:0.5".
+ */
+function deathKey(side, s) {
+    return `${side}:${s.x.toFixed(4)}:${s.y.toFixed(4)}`;
+}
+
+/**
+ * Record any stickman the latest state shows dead that is not yet animating,
+ * and forget keys whose stickman is gone (a rematch regenerates the whole
+ * board, so its old keys must not linger). Called with each incoming state.
+ *
+ * @param {object} st - The latest `state` message.
+ * @returns {boolean} True when at least one death animation is still running.
+ */
+function syncDeaths(st) {
+    const now = performance.now();
+    const alive = new Set();
+
+    for (const side of ['own', 'opp']) {
+        for (const s of st[side] || []) {
+            if (!s.dead) continue;
+            const key = deathKey(side, s);
+            alive.add(key);
+            if (!deathAt.has(key)) {
+                // Freshly seen dead: start its animation from the top. A
+                // stickman already dead when this page loaded (a reload
+                // mid-battle) gets the same treatment, which reads as a
+                // board settling rather than a bug.
+                deathAt.set(key, now);
+            }
+        }
+    }
+
+    for (const key of Array.from(deathAt.keys())) {
+        if (!alive.has(key)) deathAt.delete(key);
+    }
+
+    return deathAt.size > 0;
+}
+
+/**
+ * Draw a dying stickman: it topples sideways about its feet, the way a paper
+ * figure falls over. Falls away from the fold line — left for the own army,
+ * right for the foe — so the fall never points into the fold.
+ *
+ * @param {number} x - Left edge of the figure's rect, logical px.
+ * @param {number} y - Top edge of the figure's rect, logical px.
+ * @param {number} fw - Rect width, logical px.
+ * @param {number} fh - Rect height, logical px.
+ * @param {string} color - Stroke/outline colour.
+ * @param {number} p - Fall progress in 0..1 (1 = fully down).
+ * @param {boolean} right - True to fall to the right, false for the left.
+ * @returns {void}
+ */
+function drawFallingStickman(x, y, fw, fh, color, p, right) {
+    const feetY = y + fh;                 // the figure pivots on its feet
+    const eased = 1 - (1 - p) * (1 - p);  // ease-out: fast tip, soft landing
+
+    ctx.save();
+    ctx.translate(x + fw / 2, feetY);
+    ctx.rotate((right ? 1 : -1) * eased * (Math.PI / 2) * 0.95);
+    ctx.translate(-(x + fw / 2), -feetY);
+    drawStickman(x, y, fw, fh, color);
+    ctx.restore();
+}
+
+/**
+ * Draw the grave a dead stickman leaves behind: a small arched headstone
+ * with a cross on it, on a mound of earth at the token's feet. Grows out
+ * of the paper (`p` = 0 -> 1) so the fall flows straight into it.
+ *
+ * @param {number} x - Left edge of the token's rect, logical px.
+ * @param {number} y - Top edge of the token's rect, logical px.
+ * @param {number} fw - Rect width, logical px.
+ * @param {number} fh - Rect height, logical px.
+ * @param {string} color - Stone outline colour (ink for own, red for foe).
+ * @param {number} p - Rise progress in 0..1.
+ * @returns {void}
+ */
+function drawGrave(x, y, fw, fh, color, p) {
+    const cx = x + fw / 2;
+    const groundY = y + fh * 0.98;       // slightly above the rect's floor
+    const sw = fw * 0.62;                // headstone width
+    const sh = fh * 0.5 * p;             // headstone height, grows with p
+    const arch = sw / 2;                 // radius of the rounded top
+    const stone = Math.max(1, fh * 0.035);
+
+    ctx.save();
+    ctx.lineJoin = 'round';
+
+    // Mound of earth under the stone: only appears with the stone.
+    ctx.globalAlpha = 0.35 * p;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.ellipse(cx, groundY, fw * 0.42 * p, fh * 0.07, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Headstone: a rectangle capped by a semicircular arch.
+    ctx.globalAlpha = p;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = stone;
+    ctx.beginPath();
+    ctx.moveTo(cx - sw / 2, groundY);
+    ctx.lineTo(cx - sw / 2, groundY - sh + arch);
+    ctx.arc(cx, groundY - sh + arch, sw / 2, Math.PI, 0);
+    ctx.lineTo(cx + sw / 2, groundY);
+    ctx.stroke();
+
+    // Cross, scaled down with the stone so it never spills past the arch.
+    ctx.lineWidth = Math.max(1, stone * 0.8);
+    const cy = groundY - sh * 0.55;
+    const arm = sh * 0.16;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy - arm * 1.5);
+    ctx.lineTo(cx, cy + arm * 1.5);
+    ctx.moveTo(cx - arm, cy);
+    ctx.lineTo(cx + arm, cy);
+    ctx.stroke();
+
+    ctx.restore();
+}
+
+/**
+ * Draw one stickman token: a plain figure while alive, and while dead the
+ * topple-then-grave animation, ending on the settled grave. Progress comes
+ * from deathAt, stamped when the client first saw the token dead.
+ *
+ * @param {'own'|'opp'} side - Which army the token belongs to.
+ * @param {{x:number,y:number,w:number,h:number,dead?:boolean}} s - The token.
+ * @param {number} x - Left edge of the token's rect, logical px.
+ * @param {number} y - Top edge of the token's rect, logical px.
+ * @param {number} fw - Rect width, logical px.
+ * @param {number} fh - Rect height, logical px.
+ * @param {string} color - Stroke/outline colour.
+ * @returns {void}
+ */
+function drawToken(side, s, x, y, fw, fh, color) {
+    if (!s.dead) {
+        drawStickman(x, y, fw, fh, color);
+        return;
+    }
+
+    const t = performance.now() - (deathAt.get(deathKey(side, s)) || 0);
+    if (t < TOPPLE_MS) {
+        // Falls away from the fold: the own half is on the left, so an own
+        // stickman tips left and a foe's tips right.
+        drawFallingStickman(x, y, fw, fh, color, t / TOPPLE_MS, side === 'opp');
+    }
+    if (t >= TOPPLE_MS - GRAVE_MS * 0.5) {
+        // The grave starts rising before the fall finishes, so the two
+        // overlap instead of leaving a gap.
+        const p = Math.min(1, (t - (TOPPLE_MS - GRAVE_MS * 0.5)) / (GRAVE_MS * 1.5));
+        drawGrave(x, y, fw, fh, color, p);
+    }
+}
+
+/**
+ * Draw one shot as a dot centred on its display point, with an extra ring
+ * when the server marked it as a hit.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} c - The contain rect (scales the radius).
+ * @param {number} px - Dot centre x, logical px.
+ * @param {number} py - Dot centre y, logical px.
+ * @param {string} color - Dot colour (ink for own shots, red for theirs).
+ * @param {boolean} hit - Whether this shot hit a stickman.
+ * @returns {void}
+ */
+function drawDot(c, px, py, color, hit) {
+    const r = Math.max(3, Math.min(c.w, c.h) * 0.014);
+
+    ctx.save();
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(px, py, r, 0, Math.PI * 2);
+    ctx.fill();
+
+    if (hit) {                            // extra ring around a scoring shot
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(px, py, r * 2.2, 0, Math.PI * 2);
+        ctx.stroke();
+    }
+    ctx.restore();
+}
+
+/**
+ * Draw the HUD: the two scores in the paper's top corners and, during
+ * battle, a small hint line along the bottom.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
+ * @returns {void}
+ */
+function drawHud(c) {
+    const size = Math.max(12, Math.round(Math.min(c.w, c.h) * 0.038));
+    const pad = Math.round(size * 0.7);
+    const you = state ? state.youScore : 0;
+    const opp = state ? state.oppScore : 0;
+    const yourTurn = !!state && state.turn === 'you';
+
+    ctx.save();
+    ctx.font = `600 ${size}px system-ui, sans-serif`;
+    ctx.textBaseline = 'top';
+
+    ctx.fillStyle = INK;                  // own score, top-left of own half
+    ctx.textAlign = 'left';
+    ctx.fillText(`YOU ${you}`, c.x + pad, c.y + pad);
+
+    ctx.fillStyle = OPP_COLOR;            // opponent score, top-right
+    ctx.textAlign = 'right';
+    ctx.fillText(`OPPONENT ${opp}`, c.x + c.w - pad, c.y + pad);
+
+    if (state && state.phase === 'battle') {
+        // Round and turn, centred between the two scores. Players fire one
+        // shot each in turn, so this line is the answer to "may I shoot?".
+        ctx.textAlign = 'center';
+        ctx.fillStyle = yourTurn ? INK : 'rgba(43, 43, 43, 0.4)';
+        ctx.fillText(`ROUND ${state.round} · ${yourTurn ? 'YOUR TURN' : 'THEIR TURN'}`,
+            c.x + c.w / 2, c.y + pad);
+
+        // Bottom hint follows the same rule as the click handler.
+        ctx.fillStyle = 'rgba(43, 43, 43, 0.65)';
+        ctx.textBaseline = 'bottom';
+        ctx.fillText(yourTurn ? 'Click your half to fire' : 'Waiting for their shot…',
+            c.x + c.w / 2, c.y + c.h - pad);
+    }
+    ctx.restore();
+}
+
+/**
+ * Shrink a font size (only if needed) so `text` fits inside `maxW`.
+ * Requires `ctx.font` to be set as a side effect, so call it between a
+ * save()/restore() pair.
+ *
+ * @param {string} weight - Font weight prefix, e.g. "700 " or "".
+ * @param {string} text - The text to measure.
+ * @param {number} size - Desired font size in px.
+ * @param {number} maxW - Maximum allowed text width in px.
+ * @returns {number} A font size in px that fits maxW.
+ */
+function fitText(weight, text, size, maxW) {
+    ctx.font = `${weight}${size}px system-ui, sans-serif`;
+    const tw = ctx.measureText(text).width;
+    if (tw > maxW && tw > 0) {
+        return Math.max(10, Math.floor(size * (maxW / tw)));
+    }
+    return size;
+}
+
+/**
+ * Draw a centred, semi-transparent panel over the paper with a large
+ * heading and optional smaller lines beneath it.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
+ * @param {string} title - The large heading line.
+ * @param {string[]} subLines - Smaller lines shown under the heading.
+ * @param {string} titleColor - Heading colour.
+ * @returns {void}
+ */
+function drawPanel(c, title, subLines, titleColor) {
+    const pw = Math.min(c.w * 0.7, 560);
+    const ph = Math.min(c.h * 0.5, 300);
+    const px = c.x + (c.w - pw) / 2;
+    const py = c.y + (c.h - ph) / 2;
+    const midX = c.x + c.w / 2;
+    const maxW = pw * 0.86;
+
+    ctx.save();
+
+    // Fit the text to the panel so long lines never clip or spill outside.
+    let titleSize = Math.max(18, Math.round(Math.min(pw * 0.16, ph * 0.28)));
+    titleSize = fitText('700 ', title, titleSize, maxW);
+    let subSize = Math.max(12, Math.round(titleSize * 0.42));
+    for (const line of subLines) {
+        subSize = Math.min(subSize, fitText('', line, subSize, maxW));
+    }
+
+    // Semi-transparent sheet over the paper, with a fold-coloured border.
+    ctx.fillStyle = 'rgba(247, 243, 232, 0.92)';
+    ctx.fillRect(px, py, pw, ph);
+    ctx.strokeStyle = FOLD;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(px, py, pw, ph);
+
+    // Vertically centre the whole text block inside the panel.
+    const blockH = titleSize * 1.3 + subLines.length * subSize * 1.7;
+    let y = py + (ph - blockH) / 2 + titleSize * 0.65;
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillStyle = titleColor;
+    ctx.font = `700 ${titleSize}px system-ui, sans-serif`;
+    ctx.fillText(title, midX, y);
+
+    ctx.fillStyle = INK;
+    ctx.font = `${subSize}px system-ui, sans-serif`;
+    y += titleSize * 0.55 + subSize * 0.85;
+    for (const line of subLines) {
+        ctx.fillText(line, midX, y);
+        y += subSize * 1.7;
+    }
+    ctx.restore();
+}
+
+/**
+ * Draw the "connection lost" banner across the top of the paper after an
+ * unexpected socket close.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
+ * @returns {void}
+ */
+function drawDisconnected(c) {
+    const bh = Math.max(30, Math.round(c.h * 0.1));
+    const size = Math.max(13, Math.round(bh * 0.42));
+
+    ctx.save();
+    ctx.fillStyle = 'rgba(209, 10, 30, 0.94)';
+    ctx.fillRect(c.x, c.y, c.w, bh);
+    ctx.fillStyle = PAPER;
+    ctx.font = `600 ${size}px system-ui, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('Connection lost — reload to rejoin', c.x + c.w / 2, c.y + bh / 2);
+    ctx.restore();
+}
+
+/**
+ * Draw the phase overlays: the lobby waiting panel, the game-over panel,
+ * and — always last so it stays visible — the lost-connection banner.
+ *
+ * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
+ * @returns {void}
+ */
+function drawOverlays(c) {
+    if (state && state.phase === 'lobby') {
+        drawPanel(c, 'Waiting for an opponent…', [], INK);
+    } else if (state && state.phase === 'over') {
+        // Three outcomes: win, lose, or a draw — the last when the deciding
+        // round wiped both boards. The server only settles the result once
+        // both players have taken the shot their round owes them, so this
+        // screen never appears while a move is still outstanding.
+        const draw = state.winner === 'draw';
+        const won = state.winner === 'you';
+        drawPanel(
+            c,
+            draw ? 'DRAW' : won ? 'YOU WIN' : 'YOU LOSE',
+            [`Final score  ${state.youScore} – ${state.oppScore}`, 'Click to play again'],
+            draw || won ? INK : OPP_COLOR
+        );
+    }
+    if (disconnected) {
+        drawDisconnected(c);
+    }
+}
+
+/**
  * Render one frame: desktop margin, contained 16:9 paper, vertical fold
- * line, and half labels.
+ * line, stickmen, shots, HUD and overlays — all from the latest `state`.
  * @returns {void}
  */
 function draw() {
@@ -125,19 +576,60 @@ function draw() {
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // Target stickmen (red rectangles) on the player's own half.
-    ctx.fillStyle = '#d10a1e';
-    for (const s of stickmen) {
-        ctx.fillRect(c.x + s.x * c.w, c.y + s.y * c.h, s.w * c.w, s.h * c.h);
+    if (state) {
+        // Own stickmen: local frame (0..1 across own half) scaled into the
+        // LEFT half of the paper. Ink, because they are yours. Dead ones
+        // (s.dead) play out the topple-then-grave animation in place.
+        for (const s of state.own || []) {
+            drawToken(
+                'own',
+                s,
+                c.x + s.x * 0.5 * c.w,
+                c.y + s.y * c.h,
+                s.w * 0.5 * c.w,
+                s.h * c.h,
+                INK
+            );
+        }
+
+        // Opponent stickmen: the server already mirrored them for our view,
+        // so we only scale the local 0..1 frame into the RIGHT half — no
+        // second mirror. Red, because they are the targets; a grave in red
+        // is a target you already got.
+        for (const s of state.opp || []) {
+            drawToken(
+                'opp',
+                s,
+                c.x + 0.5 * c.w + s.x * 0.5 * c.w,
+                c.y + s.y * c.h,
+                s.w * 0.5 * c.w,
+                s.h * c.h,
+                OPP_COLOR
+            );
+        }
+
+        // Shots as dots: ours in the left half (ink), theirs in the right
+        // (red). x/y arrive in the shooter's local frame, so the same
+        // half-scaling as the stickmen applies.
+        for (const shot of state.shots || []) {
+            const mine = shot.by === 'you';
+            const px = mine
+                ? c.x + shot.x * 0.5 * c.w
+                : c.x + 0.5 * c.w + shot.x * 0.5 * c.w;
+            drawDot(c, px, c.y + shot.y * c.h, mine ? INK : OPP_COLOR, !!shot.hit);
+        }
+
+        // Not your turn: your own half dims, so the board says at a glance
+        // that nothing you click will fire yet. The opponent's half is the
+        // target, never the trigger, so it stays clear.
+        if (state.phase === 'battle' && state.turn !== 'you') {
+            ctx.fillStyle = 'rgba(30, 30, 30, 0.12)';
+            ctx.fillRect(c.x, c.y, c.w / 2, c.h);
+        }
     }
 
-    // Half labels.
-    ctx.fillStyle = INK;
-    ctx.font = '14px system-ui, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'top';
-    ctx.fillText('YOU', c.x + c.w / 4, c.y + 12);
-    ctx.fillText('OPPONENT', c.x + (3 * c.w) / 4, c.y + 12);
+    drawHud(c);
+    drawOverlays(c);
 
     ctx.restore();
 }
@@ -149,6 +641,29 @@ function draw() {
 function render() {
     resize();
     draw();
+}
+
+/** True while a requestAnimationFrame loop is already running. */
+let animating = false;
+
+/**
+ * Drive the death animations: repaint every frame while any stickman is
+ * still toppling or rising as a grave, then stop. Restarted by syncDeaths
+ * on each new state; never runs two loops at once.
+ * @returns {void}
+ */
+function animate() {
+    if (animating) return;
+    animating = true;
+    const tick = () => {
+        render();
+        if (deathAt.size > 0) {
+            requestAnimationFrame(tick);   // still animating: next frame
+        } else {
+            animating = false;
+        }
+    };
+    requestAnimationFrame(tick);
 }
 
 window.addEventListener('resize', render);
@@ -184,7 +699,9 @@ function sendJSON(message) {
 };
 
 /**
- * Attempt to (re)connect to the server. Called on load and after a drop.
+ * Open the game's WebSocket. Called once on load; a connection that drops
+ * later is NOT re-opened (a fresh socket would join as a brand-new player),
+ * so it surfaces the lost-connection banner instead.
  * @returns {void}
  */
 function connect() {
@@ -199,27 +716,54 @@ function connect() {
     };
 
     socket.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        if (msg.type === MSG_STICKMEN) {
-            stickmen = msg.items || [];
-            render();
+        let msg;
+        try {
+            msg = JSON.parse(event.data);
+        } catch (err) {
+            console.warn('ignoring malformed message', err);
+            return;
         }
+        if (!msg || typeof msg !== 'object') return;
+
+        if (msg.type === MSG_WELCOME) {
+            seat = typeof msg.seat === 'number' ? msg.seat : -1;
+        } else if (msg.type === MSG_STATE) {
+            state = msg;                 // store the whole message, render as-is
+            // Stamp newly dead stickmen so their topple-into-grave animation
+            // starts on this frame, and keep repainting until it finishes.
+            if (syncDeaths(msg)) {
+                animate();
+            } else {
+                render();
+            }
+        }
+        // Unknown message types are ignored on purpose.
     };
 
     socket.onerror = (err) => { console.error(err); };
 
-    // socket.onclose = () => { setTimeout(connect, 1000); };
+    socket.onclose = () => {
+        socket = null;
+        // An intentional close (page unload) must not show the banner.
+        if (!closingIntentionally) {
+            disconnected = true;
+            render();
+        }
+    };
 }
 
 /**
  * Tear down the current socket when the user leaves the page (reload, tab
  * close, navigation). Without this a reload would orphan the old socket on the
  * server, and its follow-up `join` would be admitted as a second player.
+ * The intentional-close flag keeps this teardown from being reported as a
+ * lost connection.
  * @returns {void}
  */
 function closeSocket() {
+    closingIntentionally = true;
     if (socket) {
-        socket.onclose = null;   // stop the reconnect loop from firing again
+        socket.onclose = null;
         socket.close();
         socket = null;
     }
@@ -232,12 +776,14 @@ window.addEventListener('beforeunload', closeSocket);
 connect();
 
 /**
- * React to clicks on the play area: only register clicks that land on the
- * player's OWN half (the LEFT half, left of the fold line). Convert the
- * pointer position into normalized (0–1) paper coordinates so the sent
- * coordinate is independent of the current canvas/window size, and, when
- * valid, send them to the server. Dots are placed only on the player's own
- * half, so clicks on the opponent's half are ignored.
+ * React to clicks on the play area: convert the pointer position into
+ * normalized paper coordinates (0..1 across the WHOLE paper, so the own
+ * half is 0..0.5) and dispatch by phase. Clicks that miss the paper are
+ * ignored; during battle only the own half is clickable, and only while it
+ * is this player's turn (the players fire one shot each in turn), and the
+ * shot is sent in the player's LOCAL frame — the wire's x spans just that
+ * half, so paper x `nx` becomes `nx * 2`. After the game is over, any click
+ * on the paper asks for a rematch. The lobby ignores clicks entirely.
  *
  * @param {PointerEvent} event - The click event.
  * @returns {void}
@@ -259,12 +805,24 @@ function onClick(event) {
     // Ignore clicks that miss the paper entirely.
     if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
 
+    // Game over: any click on the paper requests a rematch.
+    if (state && state.phase === 'over') {
+        sendJSON({ type: MSG_REMATCH });
+        return;
+    }
+
     // Only the player's own half (LEFT of the fold, nx < 0.5) is clickable.
     if (nx >= 0.5) return;
 
-    // send JSON shot message: `{type: 'shot', x, y}` with x/y as normalized
-    // (0–1) relative coordinates, matching the server's wire format.
-    sendJSON({ type: MSG_SHOT, x: nx, y: ny });
+    // Fire in battle, but only on YOUR turn — the two players alternate, one
+    // shot each. The server enforces the same rule, so an early click would be
+    // rejected anyway; this just keeps the input honest with the HUD. x is
+    // doubled because the wire uses the player's own local frame (0 = outer
+    // edge, 1 = fold), not the whole paper's.
+    if (state && state.phase === 'battle' && state.turn === 'you') {
+        sendJSON({ type: MSG_SHOT, x: nx * 2, y: ny });
+    }
+    // Lobby, the opponent's turn, or no state yet: nothing to send.
 }
 
 canvas.addEventListener('click', onClick);
