@@ -77,6 +77,8 @@ const FOLD_CAMERA = 3.5;
 
 /** Milliseconds a transferred shot mark takes to grow into place. */
 const LAND_MS = 180;
+/** Milliseconds a scoring shot's hit ring takes to draw itself in. */
+const RING_MS = 160;
 
 /**
  * Death animations in flight, keyed "side:x:y" (the stickman's normalized
@@ -96,11 +98,13 @@ const deathAt = new Map();
 let fold = null;
 
 /**
- * When each shot's transferred mark (the copy the fold presses onto the far
- * side of the line) may show, keyed by the shot's index in `state.shots`.
- * Stamped with the press moment of the fold the shot arrived with; indexes
- * the latest state no longer carries are pruned in syncShots.
- * @type {Map<number, number>}
+ * When each shot may show what, keyed by the shot's index in `state.shots`:
+ * `land` is when the transferred mark (the copy the fold presses onto the far
+ * side of the line) grows in — the press moment of the fold the shot arrived
+ * with — and `ring` is when its hit circle may appear: only once the paper is
+ * flat again, so the circle reads as the verdict rather than part of the
+ * reveal. Indexes the latest state no longer carries are pruned in syncShots.
+ * @type {Map<number, {land:number, ring:number}>}
  */
 const landedAt = new Map();
 
@@ -419,26 +423,31 @@ function drawToken(side, s, x, y, fw, fh, color) {
  * @param {number} py - Dot centre y, logical px.
  * @param {string} color - Dot colour (ink for own shots, red for theirs).
  * @param {boolean} hit - Whether this shot hit a stickman.
- * @param {number} [scale] - Growth in 0..1, used to pop a transferred mark
- *   into place; omitted or 1 draws the dot at full size.
+ * @param {number} [scale] - Dot growth in 0..1, used to pop a transferred
+ *   mark into place; omitted or 1 draws the dot at full size.
+ * @param {number} [ring] - Growth of the hit ring in 0..1, decoupled from the
+ *   dot so a caller can hold the ring back — the fold waits to stamp the
+ *   verdict until the paper lies flat. Tied to `scale` when omitted.
  * @returns {void}
  */
-function drawDot(c, px, py, color, hit, scale) {
+function drawDot(c, px, py, color, hit, scale, ring) {
     const s = scale === undefined ? 1 : scale;
-    const r = Math.max(3, Math.min(c.w, c.h) * 0.014) * s;
+    const rs = ring === undefined ? s : ring;
+    const base = Math.max(3, Math.min(c.w, c.h) * 0.014);
 
     ctx.save();
     ctx.globalAlpha = s;
     ctx.fillStyle = color;
     ctx.beginPath();
-    ctx.arc(px, py, r, 0, Math.PI * 2);
+    ctx.arc(px, py, base * s, 0, Math.PI * 2);
     ctx.fill();
 
-    if (hit) {                            // extra ring around a scoring shot
+    if (hit && rs > 0) {                  // extra ring around a scoring shot
+        ctx.globalAlpha = rs;
         ctx.strokeStyle = color;
-        ctx.lineWidth = 2;
+        ctx.lineWidth = Math.max(1, 2 * rs);
         ctx.beginPath();
-        ctx.arc(px, py, r * 2.2, 0, Math.PI * 2);
+        ctx.arc(px, py, base * 2.2 * rs, 0, Math.PI * 2);
         ctx.stroke();
     }
     ctx.restore();
@@ -640,17 +649,34 @@ function revealAt(now) {
  * @returns {void}
  */
 function syncShots(st) {
-    const at = revealAt(performance.now());
+    const now = performance.now();
+    const at = revealAt(now);
+    // The mark waits for the press; the hit circle waits for the sheet to lie
+    // flat again, so nothing gives the result away while the paper folds.
+    const ring = fold ? fold.t0 + FOLD_TOTAL_MS : now;
     const alive = new Set();
 
     (st.shots || []).forEach((_, i) => {
         alive.add(i);
-        if (!landedAt.has(i)) landedAt.set(i, at);
+        if (!landedAt.has(i)) landedAt.set(i, { land: at, ring });
     });
 
     for (const i of Array.from(landedAt.keys())) {
         if (!alive.has(i)) landedAt.delete(i);
     }
+}
+
+/**
+ * How much of a timed effect has played out: 0 until its start time, 1 once
+ * `ms` has passed, linear in between. Used to grow marks and rings in.
+ *
+ * @param {number} now - The current time, in milliseconds.
+ * @param {number} at - When the effect starts, in milliseconds.
+ * @param {number} ms - How long the growth takes.
+ * @returns {number} Growth in 0..1.
+ */
+function growth(now, at, ms) {
+    return Math.min(1, Math.max(0, (now - at) / ms));
 }
 
 /**
@@ -757,9 +783,11 @@ function blit(x, y, bw, bh) {
  * Draw the transferred copy of every shot: the mark the fold pressed onto the
  * far side of the line, mirrored exactly across the fold from where it was
  * aimed — which is where it landed, since the server's hit test mirrors the
- * same way. Each mark grows in when its `landedAt` stamp arrives (the press
- * moment while a fold runs). `rect` clips the marks to one half, which is
- * what the fold path needs to lay them over the stationary sheet.
+ * same way. Each mark grows in when its `land` time arrives (the press moment
+ * while a fold runs); its hit ring waits for `ring`, when the paper is flat
+ * again, so the fold never gives the verdict away. `rect` clips the marks to
+ * one half, which is what the fold path needs to lay them over the
+ * stationary sheet.
  *
  * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
  * @param {{x:number,y:number,w:number,h:number}|null} rect - Clip rect, or null for none.
@@ -778,14 +806,16 @@ function drawLandingDots(c, rect, now) {
     }
 
     (state.shots || []).forEach((shot, i) => {
-        const t = now - (landedAt.has(i) ? landedAt.get(i) : now);
+        const rec = landedAt.get(i);
+        const t = now - (rec ? rec.land : now);
         if (t < 0) return; // not pressed through yet
         const mine = shot.by === 'you';
         const aimed = mine
             ? c.x + shot.x * 0.5 * c.w
             : c.x + 0.5 * c.w + shot.x * 0.5 * c.w;
-        drawDot(c, 2 * fx - aimed, c.y + shot.y * c.h,
-            mine ? INK : OPP_COLOR, !!shot.hit, Math.min(1, t / LAND_MS));
+        drawDot(c, 2 * fx - aimed, c.y + shot.y * c.h, mine ? INK : OPP_COLOR,
+            !!shot.hit, growth(now, rec ? rec.land : now, LAND_MS),
+            growth(now, rec ? rec.ring : now, RING_MS));
     });
 
     ctx.restore();
@@ -1050,14 +1080,18 @@ function drawBoard(c, landing) {
 
         // Shots as dots: ours in the left half (ink), theirs in the right
         // (red). x/y arrive in the shooter's local frame, so the same
-        // half-scaling as the stickmen applies.
-        for (const shot of state.shots || []) {
+        // half-scaling as the stickmen applies. The dot shows where the shot
+        // was aimed; its ring is the verdict, and waits until the paper is
+        // flat again so the fold never gives the result away early.
+        (state.shots || []).forEach((shot, i) => {
             const mine = shot.by === 'you';
             const px = mine
                 ? c.x + shot.x * 0.5 * c.w
                 : c.x + 0.5 * c.w + shot.x * 0.5 * c.w;
-            drawDot(c, px, c.y + shot.y * c.h, mine ? INK : OPP_COLOR, !!shot.hit);
-        }
+            const rec = landedAt.get(i);
+            drawDot(c, px, c.y + shot.y * c.h, mine ? INK : OPP_COLOR, !!shot.hit,
+                1, growth(performance.now(), rec ? rec.ring : 0, RING_MS));
+        });
 
         // Transferred marks, mirrored across the fold onto the half the shot
         // landed on. The fold path holds these back until its press.

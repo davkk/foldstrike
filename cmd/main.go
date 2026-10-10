@@ -68,8 +68,12 @@ const (
 	// when a rematch regenerates the board.
 	StickmanCount = 8
 	// HitRadius is the hit-circle radius around a stickman centre, in the
-	// owner's local coordinates.
-	HitRadius = 0.10
+	// owner's local coordinates — which is also the radius as a fraction of
+	// the PAPER'S height, because the hit test normalises both axes into that
+	// unit (see HalfAspect). It is sized to the drawn figure: the stickman's
+	// ink spans about 0.147 of the paper height, so a circle of 0.075 covers
+	// it head to feet without scoring from well outside the drawing.
+	HitRadius = 0.075
 	// stickmanW is the stored rectangle width in the owner's local frame.
 	// Local x spans HALF the paper width, so the client scales it by 0.5.
 	stickmanW = 0.06
