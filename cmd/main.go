@@ -1,14 +1,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io/fs"
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"foldstrike"
 )
 
 // MessageType classifies a JSON message on the wire. The `type` field of
@@ -734,10 +741,55 @@ func wsHandler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
-func main() {
-	http.Handle("/", http.FileServer(http.Dir("./public")))
-	http.HandleFunc("/ws", wsHandler)
+// shutdownTimeout bounds how long a graceful shutdown waits for in-flight
+// requests. Upgraded WebSockets are hijacked and invisible to Shutdown, so
+// live game sockets end when the process exits, not after this timeout.
+const shutdownTimeout = 10 * time.Second
 
-	log.Println("Server listening on http://0.0.0.0:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+func main() {
+	// The client assets ship inside the binary; serve them straight from the
+	// embedded FS instead of the working directory's ./public.
+	static, err := fs.Sub(foldstrike.PublicFS, "public")
+	if err != nil {
+		log.Fatalf("open embedded public: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.Handle("/", http.FileServer(http.FS(static)))
+	mux.HandleFunc("/ws", wsHandler)
+	// /healthz is a cheap liveness probe for the platform's router; it must
+	// not touch the room, so it stays up even mid-game.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// PORT is injected by the platform (Render sets it per instance); fall
+	// back to 8080 for local runs.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+
+	// Shut down cleanly on SIGINT/SIGTERM so the platform's redeploy/restart
+	// doesn't cut requests mid-flight.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		log.Println("Shutting down...")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Println("Shutdown error:", err)
+		}
+	}()
+
+	log.Printf("Server listening on http://0.0.0.0:%s", port)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }

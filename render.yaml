@@ -1,0 +1,15 @@
+# Render blueprint: one web service, single instance. The game keeps all
+# rooms in memory, so scaling to more than one instance would split players
+# across unrelated room sets — never raise the count above 1.
+services:
+  - type: web
+    name: foldstrike
+    runtime: go
+    plan: free
+    buildCommand: go build -o foldstrike ./cmd
+    startCommand: ./foldstrike
+    healthCheckPath: /healthz
+    envVars:
+      # Render injects PORT itself; set it here only to pin a value.
+      - key: PORT
+        value: "10000"
