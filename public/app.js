@@ -114,7 +114,9 @@ const MSG_JOIN = 'join';
 const MSG_SHOT = 'shot';
 /** Client -> server: ask for a rematch while phase is "over". */
 const MSG_REMATCH = 'rematch';
-/** Server -> client: seat assignment, `{"type":"welcome","seat":n}`. */
+/** Server -> client: seat assignment, `{"type":"welcome","seat":n}` — or
+ *  `{"type":"welcome","seat":-1,"spectator":true}` for a viewer admitted to
+ *  watch a room that already has its two players. */
 const MSG_WELCOME = 'welcome';
 /** Server -> client: full game state (phase, scores, stickmen, shots). */
 const MSG_STATE = 'state';
@@ -144,8 +146,21 @@ let dpr = 1;
  */
 let state = null;
 
-/** This connection's 0-based seat from the `welcome` message; -1 until it arrives. */
+/**
+ * This connection's 0-based seat from the `welcome` message; -1 until it
+ * arrives, and -1 for good once it identifies a spectator.
+ */
 let seat = -1;
+
+/**
+ * True when this connection was admitted to WATCH a full room rather than
+ * play in it (the `welcome` message's `spectator` flag). A spectator owns no
+ * half of the paper, so every click is inert and the HUD names the players
+ * instead of saying "you" — but the board is framed exactly as player 1 sees
+ * it, which is what the server sends.
+ * @type {boolean}
+ */
+let spectator = false;
 
 /** True only while tearing the socket down on purpose (page unload). */
 let closingIntentionally = false;
@@ -168,8 +183,6 @@ function resize() {
     canvas.height = Math.round(h * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    // The fold's offscreen board tracks the canvas exactly. Resizing a
-    // canvas clears it, which is fine: it is refilled before every fold frame.
     if (buffer.width !== canvas.width || buffer.height !== canvas.height) {
         buffer.width = canvas.width;
         buffer.height = canvas.height;
@@ -183,7 +196,7 @@ function resize() {
  */
 function contain() {
     let cw = h * RATIO;
-    if (cw > w) {                    // viewport too narrow: height-limited
+    if (cw > w) {
         cw = w;
     }
     const ch = cw / RATIO;
@@ -215,7 +228,7 @@ function foldX() {
 function drawStickman(x, y, fw, fh, color) {
     const cx = x + fw / 2;
     const headR = fh * 0.13;
-    const headY = y + fh * 0.02 + headR;   // head sits just inside the top
+    const headY = y + fh * 0.02 + headR;
     const neckY = headY + headR;
     const hipY = y + fh * 0.62;
     const shoulderY = neckY + fh * 0.05;
@@ -226,22 +239,20 @@ function drawStickman(x, y, fw, fh, color) {
     ctx.lineWidth = Math.max(1.5, fh * 0.05);
     ctx.lineCap = 'round';
 
-    // Head: a filled circle.
     ctx.beginPath();
     ctx.arc(cx, headY, headR, 0, Math.PI * 2);
     ctx.fill();
 
-    // Torso, arms and legs: one stroked path.
     ctx.beginPath();
-    ctx.moveTo(cx, neckY);                 // torso
+    ctx.moveTo(cx, neckY);
     ctx.lineTo(cx, hipY);
-    ctx.moveTo(cx, shoulderY);             // left arm, angled down
+    ctx.moveTo(cx, shoulderY);
     ctx.lineTo(cx - fw * 0.38, shoulderY + fh * 0.16);
-    ctx.moveTo(cx, shoulderY);             // right arm, angled down
+    ctx.moveTo(cx, shoulderY);
     ctx.lineTo(cx + fw * 0.38, shoulderY + fh * 0.16);
-    ctx.moveTo(cx, hipY);                  // left leg
+    ctx.moveTo(cx, hipY);
     ctx.lineTo(cx - fw * 0.3, y + fh);
-    ctx.moveTo(cx, hipY);                  // right leg
+    ctx.moveTo(cx, hipY);
     ctx.lineTo(cx + fw * 0.3, y + fh);
     ctx.stroke();
     ctx.restore();
@@ -280,12 +291,6 @@ function syncDeaths(st) {
             const key = deathKey(side, s);
             alive.add(key);
             if (!deathAt.has(key)) {
-                // Freshly seen dead: start from the top — but wait for the
-                // press when a fold runs, so the opening sheet reveals the
-                // fall instead of it playing out underneath. A stickman
-                // already dead when this page loaded (a reload mid-battle)
-                // starts at once, which reads as a board settling rather
-                // than a bug.
                 deathAt.set(key, revealAt(now));
             }
         }
@@ -311,8 +316,8 @@ function syncDeaths(st) {
  * @returns {void}
  */
 function drawFallingStickman(x, y, fw, fh, color, p, right) {
-    const feetY = y + fh;                 // the figure pivots on its feet
-    const eased = 1 - (1 - p) * (1 - p);  // ease-out: fast tip, soft landing
+    const feetY = y + fh;
+    const eased = 1 - (1 - p) * (1 - p);
 
     ctx.save();
     ctx.translate(x + fw / 2, feetY);
@@ -337,23 +342,21 @@ function drawFallingStickman(x, y, fw, fh, color, p, right) {
  */
 function drawGrave(x, y, fw, fh, color, p) {
     const cx = x + fw / 2;
-    const groundY = y + fh * 0.98;       // slightly above the rect's floor
-    const sw = fw * 0.62;                // headstone width
-    const sh = fh * 0.5 * p;             // headstone height, grows with p
-    const arch = sw / 2;                 // radius of the rounded top
+    const groundY = y + fh * 0.98;
+    const sw = fw * 0.62;
+    const sh = fh * 0.5 * p;
+    const arch = sw / 2;
     const stone = Math.max(1, fh * 0.035);
 
     ctx.save();
     ctx.lineJoin = 'round';
 
-    // Mound of earth under the stone: only appears with the stone.
     ctx.globalAlpha = 0.35 * p;
     ctx.fillStyle = color;
     ctx.beginPath();
     ctx.ellipse(cx, groundY, fw * 0.42 * p, fh * 0.07, 0, 0, Math.PI * 2);
     ctx.fill();
 
-    // Headstone: a rectangle capped by a semicircular arch.
     ctx.globalAlpha = p;
     ctx.strokeStyle = color;
     ctx.lineWidth = stone;
@@ -364,7 +367,6 @@ function drawGrave(x, y, fw, fh, color, p) {
     ctx.lineTo(cx + sw / 2, groundY);
     ctx.stroke();
 
-    // Cross, scaled down with the stone so it never spills past the arch.
     ctx.lineWidth = Math.max(1, stone * 0.8);
     const cy = groundY - sh * 0.55;
     const arm = sh * 0.16;
@@ -400,15 +402,9 @@ function drawToken(side, s, x, y, fw, fh, color) {
 
     const t = performance.now() - (deathAt.get(deathKey(side, s)) || 0);
     if (t < TOPPLE_MS) {
-        // Falls away from the fold: the own half is on the left, so an own
-        // stickman tips left and a foe's tips right. t can be negative — a
-        // death stamped for the moment a fold presses waits flat and upright
-        // until the sheet comes down on it — so the progress clamps at zero.
         drawFallingStickman(x, y, fw, fh, color, Math.max(0, t / TOPPLE_MS), side === 'opp');
     }
     if (t >= TOPPLE_MS - GRAVE_MS * 0.5) {
-        // The grave starts rising before the fall finishes, so the two
-        // overlap instead of leaving a gap.
         const p = Math.min(1, (t - (TOPPLE_MS - GRAVE_MS * 0.5)) / (GRAVE_MS * 1.5));
         drawGrave(x, y, fw, fh, color, p);
     }
@@ -442,7 +438,7 @@ function drawDot(c, px, py, color, hit, scale, ring) {
     ctx.arc(px, py, base * s, 0, Math.PI * 2);
     ctx.fill();
 
-    if (hit && rs > 0) {                  // extra ring around a scoring shot
+    if (hit && rs > 0) {
         ctx.globalAlpha = rs;
         ctx.strokeStyle = color;
         ctx.lineWidth = Math.max(1, 2 * rs);
@@ -455,7 +451,10 @@ function drawDot(c, px, py, color, hit, scale, ring) {
 
 /**
  * Draw the HUD: the two scores in the paper's top corners and, during
- * battle, a small hint line along the bottom.
+ * battle, a small hint line along the bottom. A spectator has no side of its
+ * own, so the halves are named for the players who own them and no turn is
+ * ever "yours" — the server frames a spectator's state as player 1's, so the
+ * player-relative labels below read as player 1 and player 2.
  *
  * @param {{x:number,y:number,w:number,h:number}} c - The contain rect.
  * @returns {void}
@@ -467,30 +466,35 @@ function drawHud(c) {
     const opp = state ? state.oppScore : 0;
     const yourTurn = !!state && state.turn === 'you';
 
+    const leftName = spectator ? 'PLAYER 1' : 'YOU';
+    const rightName = spectator ? 'PLAYER 2' : 'OPPONENT';
+    const turnName = spectator
+        ? (yourTurn ? "PLAYER 1'S TURN" : "PLAYER 2'S TURN")
+        : (yourTurn ? 'YOUR TURN' : 'THEIR TURN');
+
     ctx.save();
     ctx.font = `600 ${size}px system-ui, sans-serif`;
     ctx.textBaseline = 'top';
 
-    ctx.fillStyle = INK;                  // own score, top-left of own half
+    ctx.fillStyle = INK;
     ctx.textAlign = 'left';
-    ctx.fillText(`YOU ${you}`, c.x + pad, c.y + pad);
+    ctx.fillText(`${leftName} ${you}`, c.x + pad, c.y + pad);
 
-    ctx.fillStyle = OPP_COLOR;            // opponent score, top-right
+    ctx.fillStyle = OPP_COLOR;
     ctx.textAlign = 'right';
-    ctx.fillText(`OPPONENT ${opp}`, c.x + c.w - pad, c.y + pad);
+    ctx.fillText(`${rightName} ${opp}`, c.x + c.w - pad, c.y + pad);
 
     if (state && state.phase === 'battle') {
-        // Round and turn, centred between the two scores. Players fire one
-        // shot each in turn, so this line is the answer to "may I shoot?".
         ctx.textAlign = 'center';
-        ctx.fillStyle = yourTurn ? INK : 'rgba(43, 43, 43, 0.4)';
-        ctx.fillText(`ROUND ${state.round} · ${yourTurn ? 'YOUR TURN' : 'THEIR TURN'}`,
+        ctx.fillStyle = spectator || yourTurn ? INK : 'rgba(43, 43, 43, 0.4)';
+        ctx.fillText(`ROUND ${state.round} · ${turnName}`,
             c.x + c.w / 2, c.y + pad);
 
-        // Bottom hint follows the same rule as the click handler.
         ctx.fillStyle = 'rgba(43, 43, 43, 0.65)';
         ctx.textBaseline = 'bottom';
-        ctx.fillText(yourTurn ? 'Click your half to fire' : 'Waiting for their shot…',
+        ctx.fillText(
+            spectator ? 'Spectating'
+                : yourTurn ? 'Click your half to fire' : 'Waiting for their shot…',
             c.x + c.w / 2, c.y + c.h - pad);
     }
     ctx.restore();
@@ -536,7 +540,6 @@ function drawPanel(c, title, subLines, titleColor) {
 
     ctx.save();
 
-    // Fit the text to the panel so long lines never clip or spill outside.
     let titleSize = Math.max(18, Math.round(Math.min(pw * 0.16, ph * 0.28)));
     titleSize = fitText('700 ', title, titleSize, maxW);
     let subSize = Math.max(12, Math.round(titleSize * 0.42));
@@ -544,14 +547,12 @@ function drawPanel(c, title, subLines, titleColor) {
         subSize = Math.min(subSize, fitText('', line, subSize, maxW));
     }
 
-    // Semi-transparent sheet over the paper, with a fold-coloured border.
     ctx.fillStyle = 'rgba(247, 243, 232, 0.92)';
     ctx.fillRect(px, py, pw, ph);
     ctx.strokeStyle = FOLD;
     ctx.lineWidth = 2;
     ctx.strokeRect(px, py, pw, ph);
 
-    // Vertically centre the whole text block inside the panel.
     const blockH = titleSize * 1.3 + subLines.length * subSize * 1.7;
     let y = py + (ph - blockH) / 2 + titleSize * 0.65;
 
@@ -601,21 +602,22 @@ function drawDisconnected(c) {
  * @returns {void}
  */
 function drawOverlays(c) {
-    // Panels wait for the sheet to lie flat: a result announced mid-fold
-    // would fold away with the half it is printed on.
     if (state && state.phase === 'lobby' && !fold) {
         drawPanel(c, 'Waiting for an opponent…', [], INK);
     } else if (state && state.phase === 'over' && !fold) {
-        // Three outcomes: win, lose, or a draw — the last when the deciding
-        // round wiped both boards. The server only settles the result once
-        // both players have taken the shot their round owes them, so this
-        // screen never appears while a move is still outstanding.
         const draw = state.winner === 'draw';
         const won = state.winner === 'you';
+        const title = draw ? 'DRAW'
+            : spectator ? (won ? 'PLAYER 1 WINS' : 'PLAYER 2 WINS')
+                : (won ? 'YOU WIN' : 'YOU LOSE');
+        const subLines = [`Final score  ${state.youScore} – ${state.oppScore}`];
+        if (!spectator) {
+            subLines.push('Click to play again');
+        }
         drawPanel(
             c,
-            draw ? 'DRAW' : won ? 'YOU WIN' : 'YOU LOSE',
-            [`Final score  ${state.youScore} – ${state.oppScore}`, 'Click to play again'],
+            title,
+            subLines,
             draw || won ? INK : OPP_COLOR
         );
     }
@@ -651,8 +653,6 @@ function revealAt(now) {
 function syncShots(st) {
     const now = performance.now();
     const at = revealAt(now);
-    // The mark waits for the press; the hit circle waits for the sheet to lie
-    // flat again, so nothing gives the result away while the paper folds.
     const ring = fold ? fold.t0 + FOLD_TOTAL_MS : now;
     const alive = new Set();
 
@@ -808,7 +808,7 @@ function drawLandingDots(c, rect, now) {
     (state.shots || []).forEach((shot, i) => {
         const rec = landedAt.get(i);
         const t = now - (rec ? rec.land : now);
-        if (t < 0) return; // not pressed through yet
+        if (t < 0) return;
         const mine = shot.by === 'you';
         const aimed = mine
             ? c.x + shot.x * 0.5 * c.w
@@ -861,7 +861,7 @@ function shadeFoldSide(rect, dir, theta) {
 function shadeSlice(x, sw, c, theta) {
     const cos = Math.cos(theta);
     if (cos >= 0) {
-        const a = 0.32 * (1 - cos); // flat-on: unshaded; edge-on: fully turned
+        const a = 0.32 * (1 - cos);
         if (a < 0.005) return;
         ctx.fillStyle = `rgba(20, 20, 20, ${a.toFixed(3)})`;
     } else {
@@ -891,11 +891,9 @@ function drawFlap(c, fx, yc, theta, side) {
     const halfH = c.h / 2;
     const step = halfW / FOLD_SLICES;
     const lens = FOLD_CAMERA * halfW;
-    // The sheet's own span in buffer coordinates: strips sample nothing else.
     const sheetLo = side < 0 ? c.x : fx;
     const sheetHi = side < 0 ? fx : c.x + c.w;
 
-    // Projected x, vertical scale and angle of every strip boundary.
     const px = new Float64Array(FOLD_SLICES + 1);
     const scale = new Float64Array(FOLD_SLICES + 1);
     const angle = new Float64Array(FOLD_SLICES + 1);
@@ -909,14 +907,10 @@ function drawFlap(c, fx, yc, theta, side) {
     }
 
     for (let i = 0; i < FOLD_SLICES; i++) {
-        // Source-space anchors: strip i runs from sxA to sxB on the sheet, and
-        // those two ends project to px[i] and px[i+1].
         const sxA = fx + side * i * step;
         const sxB = fx + side * (i + 1) * step;
         const kx = (px[i + 1] - px[i]) / (sxB - sxA);
-        // Widen the source by half a pixel a side so neighbouring strips
-        // overlap instead of leaving hairline seams where bilinear sampling
-        // meets, clamped to the sheet so nothing samples past its edge.
+        // Overlap neighbouring strips by half a pixel to hide the seams.
         const lo = Math.max(sheetLo, Math.min(sxA, sxB) - 0.5);
         const hi = Math.min(sheetHi, Math.max(sxA, sxB) + 0.5);
 
@@ -929,8 +923,6 @@ function drawFlap(c, fx, yc, theta, side) {
         ctx.restore();
     }
 
-    // Paper thickness: outline the sheet's projected silhouette, which also
-    // hides the seams along the strips' top and bottom edges.
     ctx.beginPath();
     for (let i = 0; i <= FOLD_SLICES; i++) {
         const y = yc - halfH * scale[i];
@@ -966,27 +958,19 @@ function drawFolded(c) {
     renderBoardBuffer();
 
     ctx.save();
-    // The sheet may loom past the paper as it swings towards the viewer, so
-    // clip to the canvas rather than to the contain rect.
     ctx.beginPath();
     ctx.rect(0, 0, w, h);
     ctx.clip();
 
-    // The half that stays put, 1:1 from the buffer.
     const stX = flapLeft ? fx : c.x;
     blit(stX, c.y, halfW, c.h);
 
-    // The transferred marks live here: stamped for the press, so they peek
-    // out from under the sheet as it opens.
     drawLandingDots(c, { x: stX, y: c.y, w: halfW, h: c.h }, now);
 
-    // The table the sheet left behind, still shadowed by it, and the crease
-    // shadow on the sheet that stays.
     shadeFoldSide({ x: flapLeft ? c.x : fx, y: c.y, w: halfW, h: c.h },
         flapLeft ? -1 : 1, theta);
     shadeFoldSide({ x: stX, y: c.y, w: halfW, h: c.h }, flapLeft ? 1 : -1, theta);
 
-    // The sheet itself, last, so it lies over everything it covers.
     drawFlap(c, fx, yc, theta, flapLeft ? -1 : 1);
 
     ctx.restore();
@@ -1000,8 +984,6 @@ function drawFolded(c) {
 function draw() {
     const c = contain();
 
-    // Desktop/margin fill around the paper. While a fold runs this is also
-    // the table showing through where the sheet used to lie.
     ctx.fillStyle = MARGIN;
     ctx.fillRect(0, 0, w, h);
 
@@ -1025,17 +1007,14 @@ function draw() {
  * @returns {void}
  */
 function drawBoard(c, landing) {
-    // Clip everything to the paper rectangle.
     ctx.save();
     ctx.beginPath();
     ctx.rect(c.x, c.y, c.w, c.h);
     ctx.clip();
 
-    // Paper background.
     ctx.fillStyle = PAPER;
     ctx.fillRect(c.x, c.y, c.w, c.h);
 
-    // Vertical fold line down the middle of the paper.
     const fx = foldX();
     ctx.strokeStyle = FOLD;
     ctx.lineWidth = 2;
@@ -1047,9 +1026,6 @@ function drawBoard(c, landing) {
     ctx.setLineDash([]);
 
     if (state) {
-        // Own stickmen: local frame (0..1 across own half) scaled into the
-        // LEFT half of the paper. Ink, because they are yours. Dead ones
-        // (s.dead) play out the topple-then-grave animation in place.
         for (const s of state.own || []) {
             drawToken(
                 'own',
@@ -1062,10 +1038,6 @@ function drawBoard(c, landing) {
             );
         }
 
-        // Opponent stickmen: the server already mirrored them for our view,
-        // so we only scale the local 0..1 frame into the RIGHT half — no
-        // second mirror. Red, because they are the targets; a grave in red
-        // is a target you already got.
         for (const s of state.opp || []) {
             drawToken(
                 'opp',
@@ -1078,11 +1050,6 @@ function drawBoard(c, landing) {
             );
         }
 
-        // Shots as dots: ours in the left half (ink), theirs in the right
-        // (red). x/y arrive in the shooter's local frame, so the same
-        // half-scaling as the stickmen applies. The dot shows where the shot
-        // was aimed; its ring is the verdict, and waits until the paper is
-        // flat again so the fold never gives the result away early.
         (state.shots || []).forEach((shot, i) => {
             const mine = shot.by === 'you';
             const px = mine
@@ -1093,16 +1060,11 @@ function drawBoard(c, landing) {
                 1, growth(performance.now(), rec ? rec.ring : 0, RING_MS));
         });
 
-        // Transferred marks, mirrored across the fold onto the half the shot
-        // landed on. The fold path holds these back until its press.
         if (landing) {
             drawLandingDots(c, null, performance.now());
         }
 
-        // Not your turn: your own half dims, so the board says at a glance
-        // that nothing you click will fire yet. The opponent's half is the
-        // target, never the trigger, so it stays clear.
-        if (state.phase === 'battle' && state.turn !== 'you') {
+        if (state.phase === 'battle' && !spectator && state.turn !== 'you') {
             ctx.fillStyle = 'rgba(30, 30, 30, 0.12)';
             ctx.fillRect(c.x, c.y, c.w / 2, c.h);
         }
@@ -1156,13 +1118,11 @@ function animate() {
     animating = true;
     const tick = () => {
         if (fold && performance.now() - fold.t0 >= FOLD_TOTAL_MS) {
-            // The sheet is flat again: the next paint draws the plain board,
-            // overlays and all.
             fold = null;
         }
         render();
         if (animationsActive()) {
-            requestAnimationFrame(tick);   // still animating: next frame
+            requestAnimationFrame(tick);
         } else {
             animating = false;
         }
@@ -1231,12 +1191,10 @@ function connect() {
 
         if (msg.type === MSG_WELCOME) {
             seat = typeof msg.seat === 'number' ? msg.seat : -1;
+            spectator = !!msg.spectator || seat < 0;
         } else if (msg.type === MSG_STATE) {
             const prev = state;
-            state = msg;                 // store the whole message, render as-is
-            // A shot the last state did not have folds the half it was fired
-            // from; the marks and falls that state brings wait for the fold's
-            // press, and the loop repaints until everything has settled.
+            state = msg;
             maybeStartFold(prev, msg);
             syncShots(msg);
             syncDeaths(msg);
@@ -1246,14 +1204,12 @@ function connect() {
                 render();
             }
         }
-        // Unknown message types are ignored on purpose.
     };
 
     socket.onerror = (err) => { console.error(err); };
 
     socket.onclose = () => {
         socket = null;
-        // An intentional close (page unload) must not show the banner.
         if (!closingIntentionally) {
             disconnected = true;
             render();
@@ -1278,10 +1234,8 @@ function closeSocket() {
     }
 }
 
-// Register teardown once per page load.
 window.addEventListener('beforeunload', closeSocket);
 
-// Connect on load (and again on page refresh, which re-runs this script).
 connect();
 
 /**
@@ -1292,7 +1246,8 @@ connect();
  * is this player's turn (the players fire one shot each in turn), and the
  * shot is sent in the player's LOCAL frame — the wire's x spans just that
  * half, so paper x `nx` becomes `nx * 2`. After the game is over, any click
- * on the paper asks for a rematch. The lobby ignores clicks entirely.
+ * on the paper asks for a rematch. The lobby ignores clicks entirely, and a
+ * spectator ignores every click: it owns no half and starts no rematch.
  *
  * @param {PointerEvent} event - The click event.
  * @returns {void}
@@ -1300,42 +1255,29 @@ connect();
 function onClick(event) {
     const rect = canvas.getBoundingClientRect();
 
-    // Pointer position relative to the canvas, in logical px.
     const relX = event.clientX - rect.left;
     const relY = event.clientY - rect.top;
 
-    // Map into the contained paper and normalize to 0..1 on each axis.
-    // These percentages are resolution-independent, so resizing the canvas
-    // does not change where the placed dot lands.
     const c = contain();
     const nx = (relX - c.x) / c.w;
     const ny = (relY - c.y) / c.h;
 
-    // Ignore clicks that miss the paper entirely.
     if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
 
-    // The sheet is mid-fold: the board is busy, and the half it folds onto
-    // is covered anyway, so nothing is clickable until it lies flat again.
     if (fold) return;
 
-    // Game over: any click on the paper requests a rematch.
+    if (spectator) return;
+
     if (state && state.phase === 'over') {
         sendJSON({ type: MSG_REMATCH });
         return;
     }
 
-    // Only the player's own half (LEFT of the fold, nx < 0.5) is clickable.
     if (nx >= 0.5) return;
 
-    // Fire in battle, but only on YOUR turn — the two players alternate, one
-    // shot each. The server enforces the same rule, so an early click would be
-    // rejected anyway; this just keeps the input honest with the HUD. x is
-    // doubled because the wire uses the player's own local frame (0 = outer
-    // edge, 1 = fold), not the whole paper's.
     if (state && state.phase === 'battle' && state.turn === 'you') {
         sendJSON({ type: MSG_SHOT, x: nx * 2, y: ny });
     }
-    // Lobby, the opponent's turn, or no state yet: nothing to send.
 }
 
 canvas.addEventListener('click', onClick);

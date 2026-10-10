@@ -13,11 +13,12 @@ Then once the game starts, shoots dots on own half that mirror across the fold o
 - Scoring: hit = +1 point, hit stickman falls over and stays on the board as a grave (not removed). Miss leaves a mark.
 - End: first to wipe opponent side wins.
 - Rooms: create/join via short code (`/r/AB12CD`). Lobby -> placement -> battle -> game over -> rematch. Anonymous play, no accounts.
+- Spectators: a connection that arrives once both seats are taken is admitted as a read-only spectator instead of being turned away. It receives every state, owns no seat, and can neither shoot nor ask for a rematch. Its view follows player 1, and the HUD names the players (`PLAYER 1` / `PLAYER 2`) instead of saying "you". Capped at 16 watchers per room.
 
 ## Styling & Code Conventions
 
 - Use Tailwind (latest, `@tailwindcss/browser@4` via CDN) for styling. Prefer Tailwind utility classes over a dedicated `style.css` wherever possible.
-- Use JSDoc comments for JavaScript files/functions in `public/`.
+- JSDoc stays. `public/app.js` is documented with JSDoc (`@type`, `@param`, `@returns`, short summary) — treat it as type information, not as comments, and never strip it. Everything else stays comment-free: no prose doc comments, no block comments. The only other comments allowed are short inline hints on a genuinely non-obvious line, and `//go:` compiler directives.
 
 ## Tooling Constraints
 
